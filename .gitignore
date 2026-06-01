@@ -1,0 +1,3 @@
+config/db_config.json
+output/baseline_extraction/plsql/
+.venv/

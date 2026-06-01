@@ -1,0 +1,140 @@
+services:
+  oracle-database-baseline:
+    container_name: database_baseline_db
+    image: gvenzl/oracle-xe:21-slim
+    
+    environment:
+      # Oracle credentials
+      - ORACLE_PASSWORD=Oracle123
+      - APP_USER=my_user
+      - APP_USER_PASSWORD=abacate123
+      
+    ports:
+      - "1521:1521"
+      - "5500:5500"
+    
+    volumes:
+      # Persistent data storage
+      - database_baseline_data:/opt/oracle/oradata
+      
+      # Mount migrations directory for automatic execution
+      # Scripts in setup/ run as APP_USER (my_user) in XEPDB1 on first start
+      - ./migrations:/opt/oracle/scripts/setup:ro
+
+      # Mount PL/SQL objects directory
+      - ./migrations/plsql:/opt/oracle/plsql:ro
+    
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    
+    networks:
+      - database_network
+    
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+        reservations:
+          memory: 2G
+          cpus: '1'
+
+  # Automatic Migration Runner (runs inside the database container)
+  migration-runner:
+    container_name: database_migration_runner
+    image: alpine:latest
+    
+    volumes:
+      # Need docker socket to execute commands in database container
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Mount migration script
+      - ./scripts/auto_migrate.sh:/auto_migrate.sh:ro
+      - ./scripts/deploy_plsql.sh:/deploy_plsql.sh:ro
+      # Mount logs directory for automatic log capture
+      - ./logs:/logs
+    
+    depends_on:
+      oracle-database-baseline:
+        condition: service_healthy
+    
+    # Run migrations via docker exec and exit
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "============================================================"
+        echo "  MIGRATION RUNNER STARTING"
+        echo "============================================================"
+        echo ""
+        echo "Installing docker CLI..."
+        apk add --no-cache docker-cli bash > /dev/null 2>&1
+        echo "✓ Docker CLI installed"
+        echo ""
+        echo "Waiting 10 seconds for database to stabilize..."
+        sleep 10
+        echo "✓ Database should be ready"
+        echo ""
+        echo "Copying migration script to database container..."
+        docker cp /auto_migrate.sh database_baseline_db:/opt/oracle/auto_migrate.sh
+        docker cp /deploy_plsql.sh database_baseline_db:/opt/oracle/deploy_plsql.sh
+        docker exec -u root database_baseline_db chmod +x /opt/oracle/auto_migrate.sh
+        docker exec -u root database_baseline_db chmod +x /opt/oracle/deploy_plsql.sh
+        docker exec -u root database_baseline_db chown oracle:oinstall /opt/oracle/auto_migrate.sh
+        echo "✓ Script copied and permissions set"
+        echo ""
+        echo "Executing migrations..."
+        echo ""
+        MIGRATION_RESULT=0
+        if docker exec -u oracle database_baseline_db /opt/oracle/auto_migrate.sh; then
+          echo ""
+          echo "============================================================"
+          echo "  ✓✓✓ ALL MIGRATIONS SUCCESSFUL ✓✓✓"
+          echo "============================================================"
+        else
+          echo ""
+          echo "============================================================"
+          echo "  ✗✗✗ MIGRATION FAILED ✗✗✗"
+          echo "============================================================"
+          MIGRATION_RESULT=1
+        fi
+        
+        echo ""
+        echo "============================================================"
+        echo "  SAVING LOGS"
+        echo "============================================================"
+        TIMESTAMP=$$(date +%Y%m%d_%H%M%S)
+        LOG_DIR="/logs/$$TIMESTAMP"
+        mkdir -p "$$LOG_DIR"
+        echo "Log directory: $$LOG_DIR"
+        echo ""
+        echo "Capturing migration runner logs..."
+        docker logs database_migration_runner > "$$LOG_DIR/migration_runner.log" 2>&1
+        echo "  ✓ migration_runner.log"
+        echo "Capturing database logs..."
+        docker logs database_baseline_db > "$$LOG_DIR/database.log" 2>&1
+        echo "  ✓ database.log"
+        echo "Capturing Oracle alert log..."
+        docker exec database_baseline_db cat /opt/oracle/diag/rdbms/xe/XE/trace/alert_XE.log > "$$LOG_DIR/alert_XE.log" 2>&1
+        echo "  ✓ alert_XE.log"
+        echo ""
+        echo "============================================================"
+        echo "  LOGS SAVED TO: logs/$$TIMESTAMP/"
+        echo "============================================================"
+        exit $$MIGRATION_RESULT
+    
+    # Restart policy: only on failure
+    restart: "no"
+
+volumes:
+  # Persistent database storage
+  database_baseline_data:
+    name: database_baseline_data
+    driver: local
+
+networks:
+  database_network:
+    name: database_network
+    driver: bridge

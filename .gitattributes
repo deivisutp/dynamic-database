@@ -1,0 +1,9 @@
+# Shell scripts must use LF endings. On Windows, CRLF in a script's shebang
+# makes the kernel look for interpreter "/bin/bash\r" and fail with
+# "exec ...: no such file or directory". Force LF regardless of platform.
+*.sh text eol=lf
+
+# Compose/YAML and SQL migrations are executed inside Linux containers; keep LF.
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
