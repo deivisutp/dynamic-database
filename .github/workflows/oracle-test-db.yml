@@ -1,0 +1,257 @@
+name: Oracle Test Database
+
+on:
+  workflow_call:
+    inputs:
+      custom-migrations-path:
+        description: "Path to custom migrations folder in the calling repo"
+        required: false
+        type: string
+        default: ""
+      java-version:
+        description: "Java version for tests"
+        required: false
+        type: string
+        default: "17"
+      test-command:
+        description: "Command to run tests (e.g., mvn verify, ./gradlew integrationTest)"
+        required: true
+        type: string
+      working-directory:
+        description: "Working directory for test command"
+        required: false
+        type: string
+        default: "."
+    outputs:
+      db-host:
+        description: "Database host"
+        value: "localhost"
+      db-port:
+        description: "Database port"
+        value: "1521"
+      db-service:
+        description: "Database service name"
+        value: "XEPDB1"
+      db-user:
+        description: "Database user"
+        value: "my_user"
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+
+    services:
+      oracle-db:
+        image: gvenzl/oracle-xe:21-slim
+        env:
+          ORACLE_PASSWORD: Oracle123
+          APP_USER: my_user
+          APP_USER_PASSWORD: abacate123
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd "healthcheck.sh"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 180s
+
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+
+      - name: Checkout emr-dynamic-database (base migrations)
+        uses: actions/checkout@v4
+        with:
+          repository: philips-internal/emr-dynamic-database
+          path: .emr-dynamic-database
+          ref: ${{ github.event.inputs.db-version || 'main' }}
+
+      - name: Wait for Oracle to be ready
+        run: |
+          echo "Waiting for Oracle database to be fully ready..."
+          sleep 30
+
+      - name: Run base migrations
+        run: |
+          echo "============================================================"
+          echo "  RUNNING BASE MIGRATIONS"
+          echo "============================================================"
+
+          for script in 001_*.sql 002_*.sql 003_*.sql 004_*.sql 005_*.sql 006_*.sql; do
+            if [ -f ".emr-dynamic-database/migrations/$script" ]; then
+              echo "Running: $script"
+              
+              if [[ "$script" == 006_*.sql ]]; then
+                # Seed data - allow partial failures
+                docker exec ${{ job.services.oracle-db.id }} bash -c \
+                  "echo 'exit' | sqlplus -s my_user/abacate123@XEPDB1 @/tmp/$script" || true
+              else
+                docker cp ".emr-dynamic-database/migrations/$script" ${{ job.services.oracle-db.id }}:/tmp/
+                docker exec ${{ job.services.oracle-db.id }} bash -c \
+                  "echo 'exit' | sqlplus -s my_user/abacate123@XEPDB1 @/tmp/$script"
+              fi
+              
+              echo "✓ Complete: $script"
+            fi
+          done
+
+      - name: Deploy PL/SQL objects
+        run: |
+          echo "============================================================"
+          echo "  DEPLOYING PL/SQL OBJECTS"
+          echo "============================================================"
+
+          PLSQL_DIR=".emr-dynamic-database/migrations/plsql"
+
+          if [ ! -d "$PLSQL_DIR" ]; then
+            echo "⚠ PL/SQL directory not found, skipping"
+            exit 0
+          fi
+
+          compile_file() {
+            local sql_file="$1"
+            local filename=$(basename "$sql_file")
+            
+            docker cp "$sql_file" ${{ job.services.oracle-db.id }}:/tmp/plsql_obj.sql
+            
+            # Check if file starts with CREATE
+            first_word=$(head -1 "$sql_file" | awk '{print toupper($1)}')
+            
+            if [ "$first_word" = "CREATE" ]; then
+              output=$(docker exec ${{ job.services.oracle-db.id }} bash -c \
+                "echo 'SET DEFINE OFF
+          @/tmp/plsql_obj.sql' | sqlplus -s my_user/abacate123@XEPDB1" 2>&1)
+            else
+              output=$(docker exec ${{ job.services.oracle-db.id }} bash -c \
+                "echo 'SET DEFINE OFF
+          CREATE OR REPLACE
+          ' | cat - /tmp/plsql_obj.sql | sqlplus -s my_user/abacate123@XEPDB1" 2>&1)
+            fi
+            
+            if echo "$output" | grep -qi "error\|ORA-"; then
+              echo "  ⚠ Failed: $filename"
+              echo "    $(echo "$output" | grep -i "error\|ORA-" | head -1)"
+              return 1
+            else
+              echo "  ✓ Created: $filename"
+              return 0
+            fi
+          }
+
+          # 1. Package Specifications
+          if [ -d "$PLSQL_DIR/package" ]; then
+            echo "Deploying Package Specifications..."
+            for f in "$PLSQL_DIR/package"/*.sql; do
+              [ -f "$f" ] && compile_file "$f"
+            done
+          fi
+
+          # 2. Package Bodies
+          if [ -d "$PLSQL_DIR/package_body" ]; then
+            echo "Deploying Package Bodies..."
+            for f in "$PLSQL_DIR/package_body"/*.sql; do
+              [ -f "$f" ] && compile_file "$f"
+            done
+          fi
+
+          # 3. Functions
+          if [ -d "$PLSQL_DIR/function" ]; then
+            echo "Deploying Functions..."
+            for f in "$PLSQL_DIR/function"/*.sql; do
+              [ -f "$f" ] && compile_file "$f"
+            done
+          fi
+
+          # 4. Procedures
+          if [ -d "$PLSQL_DIR/procedure" ]; then
+            echo "Deploying Procedures..."
+            for f in "$PLSQL_DIR/procedure"/*.sql; do
+              [ -f "$f" ] && compile_file "$f"
+            done
+          fi
+
+          # 5. Triggers
+          if [ -d "$PLSQL_DIR/trigger" ]; then
+            echo "Deploying Triggers..."
+            for f in "$PLSQL_DIR/trigger"/*.sql; do
+              [ -f "$f" ] && compile_file "$f"
+            done
+          fi
+
+          # Recompile invalid objects
+          echo "Recompiling invalid objects..."
+          docker exec ${{ job.services.oracle-db.id }} bash -c "sqlplus -s my_user/abacate123@XEPDB1 <<EOF
+          BEGIN
+            DBMS_UTILITY.COMPILE_SCHEMA(schema => 'MY_USER', compile_all => FALSE);
+          END;
+          /
+          EXIT;
+          EOF"
+          echo "✓ PL/SQL deployment complete"
+
+      - name: Run custom migrations
+        if: inputs.custom-migrations-path != ''
+        run: |
+          echo "============================================================"
+          echo "  RUNNING CUSTOM MIGRATIONS"
+          echo "============================================================"
+
+          if [ -d "${{ inputs.custom-migrations-path }}" ]; then
+            for script in ${{ inputs.custom-migrations-path }}/*.sql; do
+              if [ -f "$script" ]; then
+                echo "Running custom: $script"
+                docker cp "$script" ${{ job.services.oracle-db.id }}:/tmp/custom_migration.sql
+                docker exec ${{ job.services.oracle-db.id }} bash -c \
+                  "echo 'exit' | sqlplus -s my_user/abacate123@XEPDB1 @/tmp/custom_migration.sql"
+                echo "✓ Complete: $script"
+              fi
+            done
+          else
+            echo "⚠ Custom migrations path not found: ${{ inputs.custom-migrations-path }}"
+          fi
+
+      - name: Verify database state
+        run: |
+          docker exec ${{ job.services.oracle-db.id }} bash -c "sqlplus -s my_user/abacate123@XEPDB1 <<EOF
+          SET PAGESIZE 50
+          SET LINESIZE 120
+
+          PROMPT
+          PROMPT Table and Index Count:
+          SELECT COUNT(*) as \"Total Tables\" FROM user_tables;
+          SELECT COUNT(*) as \"Total Indexes\" FROM user_indexes;
+
+          PROMPT
+          PROMPT PL/SQL Objects Summary:
+          SELECT object_type as \"Type\", 
+                 COUNT(*) as \"Count\",
+                 SUM(CASE WHEN status = 'VALID' THEN 1 ELSE 0 END) as \"Valid\",
+                 SUM(CASE WHEN status = 'INVALID' THEN 1 ELSE 0 END) as \"Invalid\"
+          FROM user_objects 
+          WHERE object_type IN ('PACKAGE', 'PACKAGE BODY', 'FUNCTION', 'PROCEDURE', 'TRIGGER')
+          GROUP BY object_type
+          ORDER BY object_type;
+
+          EXIT;
+          EOF"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: Run Integration Tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DB_HOST: localhost
+          DB_PORT: 1521
+          DB_SERVICE: XEPDB1
+          DB_USER: my_user
+          DB_PASSWORD: abacate123
+          SPRING_DATASOURCE_URL: jdbc:oracle:thin:@localhost:1521/XEPDB1
+          SPRING_DATASOURCE_USERNAME: my_user
+          SPRING_DATASOURCE_PASSWORD: abacate123
+        run: ${{ inputs.test-command }}
